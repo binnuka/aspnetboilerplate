@@ -22,8 +22,9 @@ namespace Abp.Application.Features
     public class AbpFeatureValueStore<TTenant, TUser> :
         IAbpZeroFeatureValueStore,
         ITransientDependency,
-        IEventHandler<EntityChangedEventData<Edition>>,
-        IEventHandler<EntityChangedEventData<EditionFeatureSetting>>
+        IEventHandler<EntityChangingEventData<Edition>>,
+        IEventHandler<EntityChangingEventData<EditionFeatureSetting>>,
+        IEventHandler<EntityChangingEventData<TenantFeatureSetting>>
 
         where TTenant : AbpTenant<TUser>
         where TUser : AbpUserBase
@@ -66,9 +67,21 @@ namespace Abp.Application.Features
             return GetValueOrNullAsync(tenantId, feature.Name);
         }
 
+        /// <inheritdoc/>
+        public virtual string GetValueOrNull(int tenantId, Feature feature)
+        {
+            return GetValueOrNull(tenantId, feature.Name);
+        }
+
         public virtual async Task<string> GetEditionValueOrNullAsync(int editionId, string featureName)
         {
             var cacheItem = await GetEditionFeatureCacheItemAsync(editionId);
+            return cacheItem.FeatureValues.GetOrDefault(featureName);
+        }
+
+        public virtual string GetEditionValueOrNull(int editionId, string featureName)
+        {
+            var cacheItem = GetEditionFeatureCacheItem(editionId);
             return cacheItem.FeatureValues.GetOrDefault(featureName);
         }
 
@@ -84,6 +97,27 @@ namespace Abp.Application.Features
             if (cacheItem.EditionId.HasValue)
             {
                 value = await GetEditionValueOrNullAsync(cacheItem.EditionId.Value, featureName);
+                if (value != null)
+                {
+                    return value;
+                }
+            }
+
+            return null;
+        }
+
+        public virtual string GetValueOrNull(int tenantId, string featureName)
+        {
+            var cacheItem = GetTenantFeatureCacheItem(tenantId);
+            var value = cacheItem.FeatureValues.GetOrDefault(featureName);
+            if (value != null)
+            {
+                return value;
+            }
+
+            if (cacheItem.EditionId.HasValue)
+            {
+                value = GetEditionValueOrNull(cacheItem.EditionId.Value, featureName);
                 if (value != null)
                 {
                     return value;
@@ -133,6 +167,40 @@ namespace Abp.Application.Features
             }
         }
 
+        [UnitOfWork]
+        public virtual void SetEditionFeatureValue(int editionId, string featureName, string value)
+        {
+            using (_unitOfWorkManager.Current.SetTenantId(null))
+            {
+                if (GetEditionValueOrNull(editionId, featureName) == value)
+                {
+                    return;
+                }
+
+                var currentFeature = _editionFeatureRepository.FirstOrDefault(f => f.EditionId == editionId && f.Name == featureName);
+
+                var feature = _featureManager.GetOrNull(featureName);
+                if (feature == null || feature.DefaultValue == value)
+                {
+                    if (currentFeature != null)
+                    {
+                        _editionFeatureRepository.Delete(currentFeature);
+                    }
+
+                    return;
+                }
+
+                if (currentFeature == null)
+                {
+                    _editionFeatureRepository.Insert(new EditionFeatureSetting(editionId, featureName, value));
+                }
+                else
+                {
+                    currentFeature.Value = value;
+                }
+            }
+        }
+
         protected virtual async Task<TenantFeatureCacheItem> GetTenantFeatureCacheItemAsync(int tenantId)
         {
             return await _cacheManager.GetTenantFeatureCache().GetAsync(tenantId, async () =>
@@ -168,17 +236,62 @@ namespace Abp.Application.Features
             });
         }
 
+        protected virtual TenantFeatureCacheItem GetTenantFeatureCacheItem(int tenantId)
+        {
+            return _cacheManager.GetTenantFeatureCache().Get(tenantId, () =>
+            {
+                TTenant tenant;
+                using (var uow = _unitOfWorkManager.Begin())
+                {
+                    using (_unitOfWorkManager.Current.SetTenantId(null))
+                    {
+                        tenant = _tenantRepository.Get(tenantId);
+
+                        uow.Complete();
+                    }
+                }
+
+                var newCacheItem = new TenantFeatureCacheItem { EditionId = tenant.EditionId };
+
+                using (var uow = _unitOfWorkManager.Begin())
+                {
+                    using (_unitOfWorkManager.Current.SetTenantId(tenantId))
+                    {
+                        var featureSettings = _tenantFeatureRepository.GetAllList();
+                        foreach (var featureSetting in featureSettings)
+                        {
+                            newCacheItem.FeatureValues[featureSetting.Name] = featureSetting.Value;
+                        }
+
+                        uow.Complete();
+                    }
+                }
+
+                return newCacheItem;
+            });
+        }
+
         protected virtual async Task<EditionfeatureCacheItem> GetEditionFeatureCacheItemAsync(int editionId)
         {
             return await _cacheManager
                 .GetEditionFeatureCache()
                 .GetAsync(
                     editionId,
-                    async () => await CreateEditionFeatureCacheItem(editionId)
+                    async () => await CreateEditionFeatureCacheItemAsync(editionId)
                 );
         }
 
-        protected virtual async Task<EditionfeatureCacheItem> CreateEditionFeatureCacheItem(int editionId)
+        protected virtual EditionfeatureCacheItem GetEditionFeatureCacheItem(int editionId)
+        {
+            return _cacheManager
+                .GetEditionFeatureCache()
+                .Get(
+                    editionId,
+                    () => CreateEditionFeatureCacheItem(editionId)
+                );
+        }
+
+        protected virtual async Task<EditionfeatureCacheItem> CreateEditionFeatureCacheItemAsync(int editionId)
         {
             var newCacheItem = new EditionfeatureCacheItem();
 
@@ -195,16 +308,37 @@ namespace Abp.Application.Features
                     await uow.CompleteAsync();
                 }
             }
-            
+
             return newCacheItem;
         }
 
-        public virtual void HandleEvent(EntityChangedEventData<EditionFeatureSetting> eventData)
+        protected virtual EditionfeatureCacheItem CreateEditionFeatureCacheItem(int editionId)
+        {
+            var newCacheItem = new EditionfeatureCacheItem();
+
+            using (var uow = _unitOfWorkManager.Begin())
+            {
+                using (_unitOfWorkManager.Current.SetTenantId(null))
+                {
+                    var featureSettings = _editionFeatureRepository.GetAllList(f => f.EditionId == editionId);
+                    foreach (var featureSetting in featureSettings)
+                    {
+                        newCacheItem.FeatureValues[featureSetting.Name] = featureSetting.Value;
+                    }
+
+                    uow.Complete();
+                }
+            }
+
+            return newCacheItem;
+        }
+
+        public virtual void HandleEvent(EntityChangingEventData<EditionFeatureSetting> eventData)
         {
             _cacheManager.GetEditionFeatureCache().Remove(eventData.Entity.EditionId);
         }
 
-        public virtual void HandleEvent(EntityChangedEventData<Edition> eventData)
+        public virtual void HandleEvent(EntityChangingEventData<Edition> eventData)
         {
             if (eventData.Entity.IsTransient())
             {
@@ -212,6 +346,14 @@ namespace Abp.Application.Features
             }
 
             _cacheManager.GetEditionFeatureCache().Remove(eventData.Entity.Id);
+        }
+
+        public virtual void HandleEvent(EntityChangingEventData<TenantFeatureSetting> eventData)
+        {
+            if (eventData.Entity.TenantId.HasValue)
+            {
+                _cacheManager.GetTenantFeatureCache().Remove(eventData.Entity.TenantId.Value);
+            }
         }
 
         protected virtual string L(string name)
